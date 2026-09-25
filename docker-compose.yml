@@ -1,0 +1,12 @@
+services:
+  raftkv:
+    build: .
+    image: raftkv:dev
+    ports:
+      - "50051:50051"
+    volumes:
+      - raftkv-data:/var/lib/raftkv
+    restart: unless-stopped
+
+volumes:
+  raftkv-data:
