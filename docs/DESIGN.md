@@ -75,6 +75,18 @@ Randomized timeouts make split votes rare, and when one happens a new election w
 
 Planned node-to-node API (`raft.proto`): `RequestVote(term, candidateId, lastLogIndex, lastLogTerm) → (term, voteGranted)`.
 
+### 3.1 Persistent term and vote (done)
+
+`PersistentState` stores `currentTerm` and `votedFor` in a small file, `raft-state`.
+
+**Why on disk, and before replying.** Take three nodes A, B and C. In term 5, A votes for B, and B now has 2 of 3 votes, so it becomes leader. If A's vote lived only in memory and A restarted, A would forget it, and could then vote for C in the same term 5. C would also have 2 of 3 votes, giving two leaders in one term (split brain). Writing the vote to disk before answering makes "at most one vote per term" survive restarts. A test (`restartedNodeCannotVoteTwiceInTheSameTerm`) reproduces exactly this scenario.
+
+**Atomic overwrite.** The log is append-only, but this file is replaced on each change, and replacing it in place would leave a half-written file after a crash. Each update writes `raft-state.tmp`, fsyncs it, atomically renames it over `raft-state`, and fsyncs the directory. The disk therefore always holds the complete old state or the complete new state. A leftover `.tmp` file at startup means the crash happened before the rename, so it is discarded and the old file is kept.
+
+**Corruption fails loudly.** The log may drop a torn tail record because it was never acknowledged. Here the reverse holds: silently resetting to "term 0, no vote" could let the node vote twice. A state file that fails its CRC32 check stops the node with an error instead.
+
+**API.** `advanceTerm(t)` moves to a higher term and clears the vote; `voteFor(id)` records a vote, allowing a repeat for the same candidate but rejecting a different one; `startElection(self)` increments the term and votes for itself in a single atomic write, so a crash can never leave the node in a new term without its own vote recorded.
+
 ## 4. Milestone 3: log replication (planned)
 
 ### 4.1 Log entries gain a term
