@@ -76,7 +76,7 @@ The full design, the Raft plan and the trade-offs are in **[docs/DESIGN.md](docs
 | # | Milestone | Status |
 |---|-----------|--------|
 | 1 | Single-node store: gRPC API, write-ahead log, crash recovery, Docker, CI | ✅ Done |
-| 2 | Leader election: terms, `RequestVote`, randomized election timeouts, persisted `currentTerm`/`votedFor` | 🔨 Next |
+| 2 | Leader election: terms, `RequestVote`, randomized election timeouts, persisted `currentTerm`/`votedFor` | 🔨 In progress (persistent term/vote done) |
 | 3 | Log replication: `AppendEntries`, consistency check, commit index, follower redirects to leader | ⏳ Planned |
 | 4 | Fault-injection test suite: kill nodes, partition the network, check no acknowledged write is lost | ⏳ Planned |
 | 5 | Kubernetes: StatefulSet with stable identities, persistent volumes, gRPC probes | ⏳ Planned |
