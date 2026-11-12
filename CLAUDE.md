@@ -1,6 +1,6 @@
 # RaftKV – Working Rules
 
-- Java 21, Maven. `mvn verify` must pass before every commit.
+- Java 21, Maven via the wrapper: always use `./mvnw` (or `mvnw.cmd` on Windows), never a global `mvn`. `./mvnw verify` must pass before every commit.
 - Each step is done on a separate branch `milestone-2/<step-name>` and goes through a pull request.
 - Commit messages: short title + description of what and why. No Co-Authored-By or Claude-Session lines.
 - All new logic gets unit tests. Tests must not use Thread.sleep – time is injected through a Clock/Scheduler interface.
