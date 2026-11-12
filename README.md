@@ -19,11 +19,11 @@ The goal is a small cluster (3–5 nodes) that keeps accepting reads and writes 
 
 ## Quick start
 
-Requirements: Java 21 and Maven, or just Docker.
+Requirements: Java 21 (Maven is downloaded by the included wrapper), or just Docker.
 
 ```bash
 # Build and run the tests
-mvn verify
+./mvnw verify                            # on Windows: mvnw.cmd verify
 
 # Run locally
 java -jar target/raftkv.jar            # listens on :50051, stores data in ./data
