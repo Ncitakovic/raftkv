@@ -87,6 +87,19 @@ Planned node-to-node API (`raft.proto`): `RequestVote(term, candidateId, lastLog
 
 **API.** `advanceTerm(t)` moves to a higher term and clears the vote; `voteFor(id)` records a vote, allowing a repeat for the same candidate but rejecting a different one; `startElection(self)` increments the term and votes for itself in a single atomic write, so a crash can never leave the node in a new term without its own vote recorded.
 
+### 3.2 Node-to-node API (done)
+
+[`raft.proto`](../src/main/proto/raft.proto) defines the `Raft` gRPC service that nodes use to talk to each other. It lives next to the client-facing `KeyValue` service in the same `raftkv.v1` package, but only cluster members call it.
+
+- `RequestVote(term, candidate_id, last_log_index, last_log_term) → (term, vote_granted)`
+- `AppendEntries(term, leader_id) → (term, success)`
+
+Every response carries the receiver's `term`, so a node that is behind (a stale candidate or a deposed leader) learns about the newer term from any reply and steps down. Node IDs are strings, matching `votedFor` in `PersistentState`. Terms and indexes are `uint64`; index 0 and term 0 mean "empty log".
+
+**`AppendEntries` is only a heartbeat for now.** Milestone 2 needs it to keep followers from starting elections, nothing more. The replication fields (`prev_log_index`, `prev_log_term`, `entries`, `leader_commit`) are documented in the proto as a comment and will be added as fields 3–6 in milestone 3. Adding fields later is backward compatible in protobuf, so nodes do not need a new API version.
+
+This step only defines the messages and generates the Java stubs. The service is not implemented or registered on the server yet.
+
 ## 4. Milestone 3: log replication (planned)
 
 ### 4.1 Log entries gain a term
