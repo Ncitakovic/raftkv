@@ -100,6 +100,23 @@ Every response carries the receiver's `term`, so a node that is behind (a stale 
 
 This step only defines the messages and generates the Java stubs. The service is not implemented or registered on the server yet.
 
+### 3.3 Vote rules (done)
+
+`VoteHandler.handle` answers a `RequestVote` (Raft paper, Figure 2). It first rejects malformed requests (`term` 0 or an empty `candidate_id`, which is what proto3 produces when the field is missing) without touching any state, so a bad request can never use up this node's vote. Then:
+
+1. **Stale term:** if the request's term is lower than `currentTerm`, refuse.
+2. **Newer term:** if it is higher, move to that term first (`advanceTerm`, which clears the vote). The node stays in the new term even if it then refuses the vote.
+3. **One vote per term:** refuse if this node already voted for a different candidate in this term. A repeated request from the same candidate is granted again, because the RPC may have been retried.
+4. **Election restriction (§5.4.1):** grant only if the candidate's log is at least as up to date: the higher last log term wins, and with equal terms the longer (or equal) log wins.
+
+A granted vote is fsync'd by `PersistentState` before `handle` returns. Every response carries the node's term after processing. The caller resets its election timer only when `vote_granted` is true. Log entries have no term yet, so the production constructor uses 0 as the last log term until milestone 3.
+
+**Known follow-ups**
+
+- One fsync for term and vote together: a higher-term request that is granted now costs two writes (`advanceTerm`, then `voteFor`). This is safe but slower; a combined atomic write, like `startElection`, is an optimization.
+- Read the last log entry's index and term in a single call (milestone 3), so the two values always come from the same log state.
+- PreVote (milestone 4): a node cut off from the cluster keeps raising its term and disrupts a healthy leader when it reconnects.
+
 ## 4. Milestone 3: log replication (planned)
 
 ### 4.1 Log entries gain a term
