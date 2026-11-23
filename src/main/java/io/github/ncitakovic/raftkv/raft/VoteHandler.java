@@ -33,6 +33,9 @@ import java.util.Optional;
  * <p><b>Election timer.</b> The caller (later {@code RaftNode}) must reset its election timeout only
  * when a vote was granted (§5.2); it reads that from {@link RequestVoteResponse#getVoteGranted()}.
  *
+ * <p><b>PreVote.</b> {@link #handlePreVote} answers the trial round that comes before a real
+ * election. It changes nothing and says yes only when there is no active leader; see there.
+ *
  * <p>Not thread-safe on its own: like all Raft state, it is called only from the node's single
  * Raft thread.
  */
@@ -72,6 +75,10 @@ public final class VoteHandler {
      *     not reply at all
      */
     public RequestVoteResponse handle(RequestVoteRequest req) throws IOException {
+        // A PreVote must never reach the rules below: they change the term and record the vote.
+        if (req.getPreVote()) {
+            throw new IllegalArgumentException("A PreVote must not change state; use handlePreVote()");
+        }
         // 0) Malformed request: refuse without touching our state (no vote, no term change).
         if (req.getTerm() < 1 || req.getCandidateId().isBlank()) {
             return reply(false);
@@ -102,6 +109,29 @@ public final class VoteHandler {
 
         // 6) Otherwise refuse.
         return reply(false);
+    }
+
+    /**
+     * Answers a PreVote (Ongaro thesis §9.6): would this node vote for the sender if it started an
+     * election now? Nothing is changed: not the term, not {@code votedFor}, nothing on disk. The
+     * caller must not reset its election timer either.
+     *
+     * <p>Yes only if the request is well formed, this node has no active leader, and the sender's log
+     * is at least as up to date as this node's (the same check as for a real vote).
+     *
+     * @param hasActiveLeader true if this node is the leader, or heard a valid AppendEntries from the
+     *     leader within the minimum election timeout. Then the cluster does not need a new election,
+     *     so a node that just restarted or was cut off cannot use one to disrupt it.
+     */
+    public RequestVoteResponse handlePreVote(RequestVoteRequest req, boolean hasActiveLeader) {
+        if (!req.getPreVote()) {
+            throw new IllegalArgumentException("Not a PreVote; use handle()");
+        }
+        boolean granted = req.getTerm() >= 1
+                && !req.getCandidateId().isBlank()
+                && !hasActiveLeader
+                && isLogUpToDate(req.getLastLogTerm(), req.getLastLogIndex());
+        return reply(granted);
     }
 
     /**

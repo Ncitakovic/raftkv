@@ -2,6 +2,7 @@ package io.github.ncitakovic.raftkv.raft;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.ncitakovic.raftkv.api.v1.RequestVoteRequest;
@@ -161,6 +162,72 @@ class VoteHandlerTest {
 
         assertFalse(resp.getVoteGranted());
         assertEquals(0, state.currentTerm());
+        assertTrue(state.votedFor().isEmpty());
+    }
+
+    // ---- PreVote ----
+
+    private static RequestVoteRequest preVote(long term, String candidate, long lastLogIndex, long lastLogTerm) {
+        return request(term, candidate, lastLogIndex, lastLogTerm).toBuilder().setPreVote(true).build();
+    }
+
+    @Test
+    void preVoteYesChangesNeitherTermNorVoteEvenAfterARestart() throws IOException {
+        state.advanceTerm(2);
+
+        RequestVoteResponse resp = handler(0, 0).handlePreVote(preVote(5, "B", 0, 0), false);
+
+        assertTrue(resp.getVoteGranted());
+        assertEquals(2, resp.getTerm(), "the reply carries our own, unchanged term");
+        assertEquals(2, state.currentTerm());
+        assertTrue(state.votedFor().isEmpty());
+        PersistentState restarted = PersistentState.open(dir);
+        assertEquals(2, restarted.currentTerm(), "nothing was written to disk");
+        assertTrue(restarted.votedFor().isEmpty());
+    }
+
+    @Test
+    void preVoteDoesNotTouchAnExistingVote() throws IOException {
+        state.advanceTerm(2);
+        state.voteFor("C");
+
+        // A PreVote yes would not even block a real vote for someone else later; it is not a vote.
+        assertTrue(handler(0, 0).handlePreVote(preVote(3, "B", 0, 0), false).getVoteGranted());
+
+        assertEquals(Optional.of("C"), state.votedFor());
+        assertEquals(Optional.of("C"), PersistentState.open(dir).votedFor());
+    }
+
+    @Test
+    void preVoteIsRefusedWhileALeaderIsActive() throws IOException {
+        state.advanceTerm(2);
+
+        RequestVoteResponse resp = handler(0, 0).handlePreVote(preVote(3, "B", 0, 0), true);
+
+        assertFalse(resp.getVoteGranted());
+        assertEquals(2, state.currentTerm());
+    }
+
+    @Test
+    void preVoteUsesTheSameLogCheckAsARealVote() {
+        VoteHandler handler = handler(5, 3); // my log: 5 entries, last one from term 3
+
+        assertFalse(handler.handlePreVote(preVote(4, "B", 10, 2), false).getVoteGranted(), "older last term");
+        assertFalse(handler.handlePreVote(preVote(4, "B", 4, 3), false).getVoteGranted(), "shorter log");
+        assertTrue(handler.handlePreVote(preVote(4, "B", 5, 3), false).getVoteGranted(), "equal log");
+    }
+
+    @Test
+    void malformedPreVoteIsRefused() {
+        assertFalse(handler(0, 0).handlePreVote(preVote(0, "B", 0, 0), false).getVoteGranted());
+        assertFalse(handler(0, 0).handlePreVote(preVote(1, "", 0, 0), false).getVoteGranted());
+    }
+
+    @Test
+    void preVoteAndRealVoteCannotBeMixedUp() {
+        VoteHandler handler = handler(0, 0);
+        assertThrows(IllegalArgumentException.class, () -> handler.handle(preVote(1, "B", 0, 0)));
+        assertThrows(IllegalArgumentException.class, () -> handler.handlePreVote(request(1, "B", 0, 0), false));
         assertTrue(state.votedFor().isEmpty());
     }
 }

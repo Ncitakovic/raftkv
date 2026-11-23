@@ -72,6 +72,11 @@ final class FakeScheduler implements Scheduler {
         return now;
     }
 
+    @Override
+    public long nowMillis() {
+        return now;
+    }
+
     private Task add(long dueAt, Runnable action) {
         Task t = new Task(dueAt, nextSeq++, action);
         queue.add(t);

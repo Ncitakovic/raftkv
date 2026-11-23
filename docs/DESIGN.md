@@ -115,7 +115,6 @@ A granted vote is fsync'd by `PersistentState` before `handle` returns. Every re
 
 - One fsync for term and vote together: a higher-term request that is granted now costs two writes (`advanceTerm`, then `voteFor`). This is safe but slower; a combined atomic write, like `startElection`, is an optimization.
 - Read the last log entry's index and term in a single call (milestone 3), so the two values always come from the same log state.
-- PreVote (milestone 4): a node cut off from the cluster keeps raising its term and disrupts a healthy leader when it reconnects.
 
 ### 3.4 Leader election state machine (done)
 
@@ -124,7 +123,7 @@ A granted vote is fsync'd by `PersistentState` before `handle` returns. Every re
 **One thread, injected time.** Every change to Raft state runs as a task on a `Scheduler`, which runs tasks one at a time on a single thread. Incoming RPCs (`onRequestVote`, `onAppendEntries`) and the responses the `RaftTransport` returns as `CompletableFuture`s are all handed to that thread, so no locks are needed. The scheduler is also the only clock: production uses `ExecutorScheduler` (a single-threaded `ScheduledExecutorService`), while tests use a `FakeScheduler` whose time moves only when the test calls `advance(ms)`. Election timeouts come from an injected `RandomGenerator`, so tests know each timeout exactly. Other threads read a published, immutable `RaftStatus` (role, term, known leader).
 
 - **Follower:** waits a random election timeout, 150–300 ms. The timer is reset **only** by a valid `AppendEntries` from the leader of the current term (or a newer one), or by granting a vote. A refused `RequestVote` or a stale `AppendEntries` does not reset it, so they cannot keep a node from noticing a dead leader.
-- **Candidate:** `PersistentState.startElection` raises the term and records its own vote in one fsync'd write, before any `RequestVote` goes out. The request carries the last log index and term. Votes are counted only if they answer the current round (same term, still a candidate), so a late vote from an earlier round never counts. Without a majority, the next timeout starts a new round in the next term.
+- **Candidate:** `PersistentState.startElection` raises the term and records its own vote in one fsync'd write, before any `RequestVote` goes out. The request carries the last log index and term. Votes are counted only if they answer the current round (same term, still a candidate), so a late vote from an earlier round never counts. Without a majority, the next timeout starts a new round. (Since §3.6, every election is preceded by a PreVote round.)
 - **Leader:** with a majority (its own vote included) it sends heartbeats to every peer at once, then every 50 ms. Votes that arrive after it won are ignored.
 - **Stepping down:** any request or response with a higher term moves the node to that term (`advanceTerm`) and makes it a follower, cancelling the heartbeat timer. For an incoming `RequestVote`, `VoteHandler` may raise the term, so `RaftNode` compares `currentTerm` before and after; a vote can be refused and the node still steps down. A valid `AppendEntries` makes a candidate or leader a follower of its sender.
 - **Timer on stepping down:** a candidate keeps its running election timer; a leader has none, so it gets a new one, or it would never start another election.
@@ -149,15 +148,38 @@ Role changes are logged as `node {id} became {ROLE} in term {term}`. A single-no
 | | Scenario | Checks |
 |---|---|---|
 | a | Start 3 nodes | Exactly one leader that all agree on; no new election in the next 2 s |
-| b | Crash the leader | The other two elect a new leader in a higher term; the old one restarts as a follower |
-| c | Partition 1 + 2 | The pair keeps a leader; the lone node campaigns in ever higher terms but is never leader; after healing, one leader again |
+| b | Crash the leader | The other two elect a new leader in a higher term; the old one restarts as a follower and the term does not change |
+| c | Partition 1 + 2 | The pair keeps a leader; the lone node is never leader; after healing, one leader again |
 | d | Isolate the leader, then heal | While cut off it still thinks it leads the old term (allowed and harmless); after healing it becomes a follower in the new term |
 | e | Split vote | With the third node down, two nodes time out at the same instant, vote for themselves and refuse each other; term 1 has no leader and a later round elects one |
 | f | Restart a voter | After a restart, a node that voted for the leader refuses a rival in the same term |
 
 **The tests catch bugs.** With the "already voted for someone else" check removed from `VoteHandler`, 144 of the 300 runs fail, because `PersistentState.voteFor` still refuses a second vote and throws. With that guard removed as well, 126 runs fail on the invariant itself, for example `Two leaders in term 1: [b, c] at t=163ms`. Neither change was committed.
 
-Scenario c shows a known gap: a node that was cut off comes back with a higher term and forces a new election although the leader was healthy. PreVote (follow-up for milestone 4) fixes this.
+PreVote (§3.6) later changed scenarios c and e and added one more; the table there is current.
+
+### 3.6 PreVote (done)
+
+**Problem.** Running the cluster in Docker showed that restarting a stopped leader often moved leadership back to it. Docker drops a stopped container's address, so for 0.1–0.6 s after the restart the other nodes' connections to it were still stuck and no heartbeat reached it. Its first election timeout (150–300 ms) expired, it raised its term and asked for votes, and the healthy leader, seeing a higher term, stepped down. A node cut off by a partition did the same when it came back. Nothing unsafe happened, but every such return cost an election with no leader in between.
+
+**Solution** (Ongaro, PhD thesis §9.6). When its election timeout expires, a node first becomes a **pre-candidate**. It sends `RequestVote` with `pre_vote = true` and `term = currentTerm + 1`, "would you vote for me?", without changing its own term or vote.
+
+- **Receiver:** changes nothing (term, `votedFor`, election timer) and says yes only if (a) it has not heard a valid `AppendEntries` from a leader within the minimum election timeout (150 ms), and (b) the sender's log is at least as up to date as its own (the same check as a real vote). A leader always says no.
+- **Sender:** with a majority of yeses (its own included) it becomes a candidate and runs a real election, which works exactly as before. Without a majority, the next timeout starts another PreVote round **in the same term**. A PreVote round is matched to its replies by a round counter, because the term does not change.
+- **Replies do not move terms.** A PreVote reply carrying a higher term does not make the sender a follower; only real RPCs apply "higher term → follower". The sender learns the newer term from the leader's next heartbeat or from a real `RequestVote`. (etcd adopts the term from a refused PreVote reply; either choice is safe, because terms only affect safety through real votes.)
+- **Real votes are unchanged.** `VoteHandler.handle` keeps the same rules and refuses a PreVote; `handlePreVote` writes nothing to disk.
+
+**Why it works.** A node can now raise its term only if a majority would vote for it, which needs a majority that has lost contact with the leader. A restarted or reconnected node whose peers still hear the leader stays a pre-candidate in its old term until the leader's heartbeat reaches it, and then it follows. Rule (a) needs a clock, so `Scheduler` got `nowMillis()` (monotonic; `FakeScheduler` time in tests). `Role` got `PRE_CANDIDATE`, and the log shows `node {id} became PRE_CANDIDATE in term {term}`.
+
+**Tests.** `VoteHandlerTest`: a PreVote changes neither term nor vote, also on disk after a restart; it is refused while a leader is active, and uses the same log check. `RaftNodeTest`: a timeout leads to a PreVote before `startElection`; without a majority the term never grows, even after replies with a higher term; a late yes from an earlier round does not count; a follower that heard the leader within 150 ms refuses without resetting its timer; a leader always refuses. Cluster scenarios (50 seeds each, 350 runs in total):
+
+| | Scenario | Checks |
+|---|---|---|
+| b′ | Crash the leader, wait for a new one, restart the old one with the others' requests to it blocked for 2 s | The new leader stays leader and its term does not change; the restarted node stays a pre-candidate in its old term, then follows |
+| c | Partition 1 + 2, then heal | The lone node does not raise its term and does not disrupt the leader; after healing, every node is in the original term under the same leader |
+| e | Split vote | Both nodes pass the PreVote at the same instant (fixed 5 ms delays), then split the real vote as before |
+
+**The tests catch the bug.** With the "heard from a leader recently" check removed, scenario b′ fails for all 50 seeds (the restarted node wins term 4 and the new leader of term 3 steps down), scenario c for 11 seeds, and one `RaftNodeTest`. The change was not committed.
 
 ## 4. Milestone 3: log replication (planned)
 

@@ -28,13 +28,18 @@ import org.slf4j.LoggerFactory;
  * <ul>
  *   <li><b>Follower.</b> Waits a random election timeout (150–300 ms by default). The timer is
  *       reset only when a valid {@code AppendEntries} arrives from the current leader, or when this
- *       node grants its vote. If it expires, the node becomes a candidate.
+ *       node grants its (real) vote. If it expires, the node becomes a pre-candidate.
+ *   <li><b>Pre-candidate</b> (PreVote, Ongaro thesis §9.6). Asks every peer "would you vote for me
+ *       in term {@code currentTerm + 1}?" without changing its term or vote. Peers that still hear
+ *       from a leader say no. With a majority of yeses (its own included) it becomes a candidate; if
+ *       the timeout expires first, it tries another PreVote round in the same term. So a node that
+ *       restarted or was cut off cannot raise its term and push a healthy leader out.
  *   <li><b>Candidate.</b> Increments its term and votes for itself in one durable write
  *       ({@link PersistentState#startElection}), asks every peer for a vote, and starts a new
  *       random timeout. With votes from a majority (its own included) it becomes leader; if the
- *       timeout expires first, it starts another round in the next term.
+ *       timeout expires first (a split vote), it goes back to a PreVote round.
  *   <li><b>Leader.</b> Sends a heartbeat to every peer at once, then every 50 ms by default.
- *   <li><b>Any role.</b> A request or response carrying a higher term moves the node to that term
+ *   <li><b>Any role.</b> A real request or response carrying a higher term moves the node to that term
  *       and makes it a follower.
  * </ul>
  *
@@ -68,7 +73,12 @@ public final class RaftNode {
     private boolean stopped;
     private Role role = Role.FOLLOWER;
     private String leaderId; // null = unknown in the current term
-    private final Set<String> votesReceived = new HashSet<>(); // candidate only, for the current term
+    // Pre-candidate: PreVote yeses of the current round. Candidate: votes of the current term.
+    private final Set<String> votesReceived = new HashSet<>();
+    // PreVote rounds keep the term, so a reply is matched to its round by this counter instead.
+    private long preVoteRound;
+    private boolean heardFromLeader; // a valid AppendEntries has arrived at least once
+    private long lastLeaderContactMs; // scheduler time of the latest one
     private Cancellable electionTimer; // null = not running (a leader has none)
     private Cancellable heartbeatTimer; // leader only
 
@@ -175,6 +185,10 @@ public final class RaftNode {
     }
 
     private RequestVoteResponse handleRequestVote(RequestVoteRequest request) throws IOException {
+        if (request.getPreVote()) {
+            // A PreVote changes nothing here: no term, no vote, no role, and the timer keeps running.
+            return voteHandler.handlePreVote(request, hasActiveLeader());
+        }
         // VoteHandler applies the vote rules and may move us to a newer term. It cannot change our
         // role, so compare the term before and after to know whether to step down.
         long termBefore = state.currentTerm();
@@ -200,6 +214,8 @@ public final class RaftNode {
             state.advanceTerm(request.getTerm());
         }
         // A valid AppendEntries from the leader of our term: follow it. Reset first (see handleRequestVote).
+        heardFromLeader = true;
+        lastLeaderContactMs = scheduler.nowMillis();
         resetElectionTimer();
         becomeFollower(request.getLeaderId());
         return appendEntriesReply(true);
@@ -207,6 +223,19 @@ public final class RaftNode {
 
     private AppendEntriesResponse appendEntriesReply(boolean success) {
         return AppendEntriesResponse.newBuilder().setTerm(state.currentTerm()).setSuccess(success).build();
+    }
+
+    /**
+     * True if the cluster has a working leader as far as this node knows: it is the leader, or it
+     * heard a valid AppendEntries within the minimum election timeout. A follower's own timeout is
+     * never shorter than that, so as long as this holds, no election is needed.
+     */
+    private boolean hasActiveLeader() {
+        if (role == Role.LEADER) {
+            return true;
+        }
+        return heardFromLeader
+                && scheduler.nowMillis() - lastLeaderContactMs < config.electionTimeoutMin().toMillis();
     }
 
     // ---- role changes ----
@@ -231,6 +260,41 @@ public final class RaftNode {
         }
     }
 
+    /**
+     * The election timeout expired: first ask whether an election could be won (PreVote), without
+     * touching the term or the vote. Nothing is written to disk, so this needs no fsync.
+     */
+    private void becomePreCandidate() throws IOException {
+        Role previous = role;
+        role = Role.PRE_CANDIDATE;
+        leaderId = null;
+        votesReceived.clear();
+        votesReceived.add(selfId);
+        long round = ++preVoteRound;
+        publishStatus();
+        if (previous != Role.PRE_CANDIDATE) {
+            logRoleChange(); // not every round: an isolated node would log one line per timeout
+        }
+        // If this round gets no majority, the next timeout starts another one, in the same term.
+        resetElectionTimer();
+
+        if (votesReceived.size() >= majority) { // a single-node cluster
+            becomeCandidate();
+            return;
+        }
+        RequestVoteRequest request = RequestVoteRequest.newBuilder()
+                .setPreVote(true)
+                .setTerm(state.currentTerm() + 1) // the term it would campaign in; not adopted by anyone
+                .setCandidateId(selfId)
+                .setLastLogIndex(lastLogIndex.getAsLong())
+                .setLastLogTerm(lastLogTerm.getAsLong())
+                .build();
+        for (String peer : peerIds) {
+            send(() -> transport.requestVote(peer, request),
+                    (response, error) -> onPreVoteResponse(peer, round, response, error));
+        }
+    }
+
     private void becomeCandidate() throws IOException {
         // Term + 1 and a vote for ourselves, in one fsync'd write, before any RequestVote goes out.
         long electionTerm = state.startElection(selfId);
@@ -240,7 +304,7 @@ public final class RaftNode {
         votesReceived.add(selfId);
         publishStatus();
         logRoleChange();
-        // "Election times out": if this round gets no majority, the timer starts the next one.
+        // "Election times out": if this round gets no majority, the timer starts a new PreVote round.
         resetElectionTimer();
 
         if (votesReceived.size() >= majority) { // a single-node cluster
@@ -286,7 +350,7 @@ public final class RaftNode {
             return;
         }
         try {
-            becomeCandidate();
+            becomePreCandidate();
         } catch (IOException e) {
             failStop(e);
         }
@@ -349,6 +413,29 @@ public final class RaftNode {
         votesReceived.add(peer);
         if (votesReceived.size() >= majority) {
             becomeLeader();
+        }
+    }
+
+    private void onPreVoteResponse(String peer, long round, RequestVoteResponse response, Throwable error) {
+        if (stopped) {
+            return;
+        }
+        if (error != null) {
+            log.debug("node {}: PreVote to {} failed: {}", selfId, peer, error.toString());
+            return; // the election timeout starts another round
+        }
+        // A PreVote reply never changes our term or role, even if it carries a higher term: only real
+        // RPCs do that. We learn the newer term from the leader's next heartbeat or a real RequestVote.
+        if (role != Role.PRE_CANDIDATE || round != preVoteRound || !response.getVoteGranted()) {
+            return;
+        }
+        votesReceived.add(peer);
+        if (votesReceived.size() >= majority) {
+            try {
+                becomeCandidate();
+            } catch (IOException e) {
+                failStop(e);
+            }
         }
     }
 

@@ -17,4 +17,10 @@ public interface Scheduler {
 
     /** Runs {@code task} on the Raft thread after {@code delay}, unless it is cancelled first. */
     Cancellable schedule(Duration delay, Runnable task);
+
+    /**
+     * The current time in milliseconds on a clock that never goes backwards. Only differences
+     * between two readings mean anything (like {@link System#nanoTime}).
+     */
+    long nowMillis();
 }
