@@ -28,6 +28,12 @@ final class FakeScheduler implements Scheduler {
             new PriorityQueue<>(Comparator.<Task>comparingLong(t -> t.dueAt).thenComparingLong(t -> t.seq));
     private long now;
     private long nextSeq;
+    private Runnable afterEachTask = () -> {};
+
+    /** Runs {@code check} after every task, e.g. to verify a cluster invariant at each step. */
+    void afterEachTask(Runnable check) {
+        this.afterEachTask = check;
+    }
 
     @Override
     public void execute(Runnable task) {
@@ -51,6 +57,7 @@ final class FakeScheduler implements Scheduler {
             now = t.dueAt;
             if (!t.cancelled) {
                 t.action.run();
+                afterEachTask.run();
             }
         }
         now = target;

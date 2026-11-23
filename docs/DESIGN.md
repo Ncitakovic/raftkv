@@ -135,6 +135,30 @@ Role changes are logged as `node {id} became {ROLE} in term {term}`. A single-no
 
 **Not yet:** the gRPC `Raft` service, a gRPC `RaftTransport`, and wiring `RaftNode` into `RaftKvServer` are the next step.
 
+### 3.5 Cluster simulation tests (done)
+
+`ClusterElectionTest` runs three `RaftNode`s in one JVM through `SimulatedCluster`: one `FakeScheduler` clock and an in-memory network in which every request and response takes a random 1–10 ms. A message to a node that is down, or over a cut link, fails like a refused connection. A crashed node is restarted as a new `RaftNode` over the **same data directory**, so it remembers only what it had fsync'd. One seed drives every message delay and election timeout, so a failing seed replays exactly.
+
+**Invariants, checked after every simulated step** (every timer, RPC and response), not only at the end:
+
+- **Election Safety:** at most one leader per term, across the whole run. Two nodes that lead the same term at different times are also caught.
+- **Terms never decrease** for a node, including across restarts.
+
+**Scenarios**, each run with 50 seeds (300 runs, about 20 s):
+
+| | Scenario | Checks |
+|---|---|---|
+| a | Start 3 nodes | Exactly one leader that all agree on; no new election in the next 2 s |
+| b | Crash the leader | The other two elect a new leader in a higher term; the old one restarts as a follower |
+| c | Partition 1 + 2 | The pair keeps a leader; the lone node campaigns in ever higher terms but is never leader; after healing, one leader again |
+| d | Isolate the leader, then heal | While cut off it still thinks it leads the old term (allowed and harmless); after healing it becomes a follower in the new term |
+| e | Split vote | With the third node down, two nodes time out at the same instant, vote for themselves and refuse each other; term 1 has no leader and a later round elects one |
+| f | Restart a voter | After a restart, a node that voted for the leader refuses a rival in the same term |
+
+**The tests catch bugs.** With the "already voted for someone else" check removed from `VoteHandler`, 144 of the 300 runs fail, because `PersistentState.voteFor` still refuses a second vote and throws. With that guard removed as well, 126 runs fail on the invariant itself, for example `Two leaders in term 1: [b, c] at t=163ms`. Neither change was committed.
+
+Scenario c shows a known gap: a node that was cut off comes back with a higher term and forces a new election although the leader was healthy. PreVote (follow-up for milestone 4) fixes this.
+
 ## 4. Milestone 3: log replication (planned)
 
 ### 4.1 Log entries gain a term
