@@ -19,7 +19,8 @@ COPY --from=build /src/target/raftkv.jar /app/raftkv.jar
 
 ENV RAFTKV_PORT=50051 \
     RAFTKV_DATA_DIR=/var/lib/raftkv
-EXPOSE 50051
+# 50051: client API; 50052: node-to-node Raft service (used only in a cluster)
+EXPOSE 50051 50052
 VOLUME ["/var/lib/raftkv"]
 
 ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-jar", "/app/raftkv.jar"]

@@ -1,0 +1,56 @@
+# A 3-node RaftKV cluster for watching leader election (milestone 2).
+#
+#   docker compose -f docker-compose.cluster.yml up --build
+#
+# Each node has its own data volume, so its term and vote survive `docker stop` / `docker start`.
+# Nodes talk to each other on port 50052 (the Raft service); the client API is on 50051 inside each
+# container, published on the host as 50051 (a), 50061 (b) and 50071 (c). Writes are not replicated
+# yet (milestone 3): each node serves the key-value API from its own store.
+
+x-raftkv: &raftkv
+  # No shared image tag: three parallel builds of one tag collide. The layers are shared by the cache.
+  build: .
+  environment: &env
+    RAFTKV_RAFT_PORT: "50052"
+
+services:
+  raftkv-a:
+    <<: *raftkv
+    container_name: raftkv-a
+    environment:
+      <<: *env
+      RAFTKV_NODE_ID: a
+      RAFTKV_PEERS: b=raftkv-b:50052,c=raftkv-c:50052
+    ports:
+      - "50051:50051"
+    volumes:
+      - raftkv-a-data:/var/lib/raftkv
+
+  raftkv-b:
+    <<: *raftkv
+    container_name: raftkv-b
+    environment:
+      <<: *env
+      RAFTKV_NODE_ID: b
+      RAFTKV_PEERS: a=raftkv-a:50052,c=raftkv-c:50052
+    ports:
+      - "50061:50051"
+    volumes:
+      - raftkv-b-data:/var/lib/raftkv
+
+  raftkv-c:
+    <<: *raftkv
+    container_name: raftkv-c
+    environment:
+      <<: *env
+      RAFTKV_NODE_ID: c
+      RAFTKV_PEERS: a=raftkv-a:50052,b=raftkv-b:50052
+    ports:
+      - "50071:50051"
+    volumes:
+      - raftkv-c-data:/var/lib/raftkv
+
+volumes:
+  raftkv-a-data:
+  raftkv-b-data:
+  raftkv-c-data:

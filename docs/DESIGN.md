@@ -61,7 +61,7 @@ The log is the source of truth; the map is derived from it. `KvStateMachine.appl
 | Log grows forever | Snapshots + compaction | Planned for milestone 6; restart time grows with log size until then. |
 | Custom binary log format | Protobuf-encoded records | Fixed layout makes torn-write detection trivial and keeps the log independent of the API schema. |
 
-## 3. Milestone 2: leader election (next)
+## 3. Milestone 2: leader election (done)
 
 New state on every node, **persisted before answering any RPC**: `currentTerm` and `votedFor`. If these were lost on restart, a node could vote twice in the same term and two leaders could be elected.
 
@@ -132,7 +132,7 @@ A granted vote is fsync'd by `PersistentState` before `handle` returns. Every re
 
 Role changes are logged as `node {id} became {ROLE} in term {term}`. A single-node cluster becomes leader on its own vote.
 
-**Not yet:** the gRPC `Raft` service, a gRPC `RaftTransport`, and wiring `RaftNode` into `RaftKvServer` are the next step.
+The gRPC `Raft` service, the gRPC `RaftTransport` and the wiring into `RaftKvServer` are in §3.7.
 
 ### 3.5 Cluster simulation tests (done)
 
@@ -181,7 +181,42 @@ PreVote (§3.6) later changed scenarios c and e and added one more; the table th
 
 **The tests catch the bug.** With the "heard from a leader recently" check removed, scenario b′ fails for all 50 seeds (the restarted node wins term 4 and the new leader of term 3 steps down), scenario c for 11 seeds, and one `RaftNodeTest`. The change was not committed.
 
-## 4. Milestone 3: log replication (planned)
+### 3.7 Running a real cluster (done)
+
+**Configuration.** `RAFTKV_PEERS` (e.g. `b=raftkv-b:50052,c=raftkv-c:50052`), `RAFTKV_NODE_ID` and `RAFTKV_RAFT_PORT` (default 50052) are parsed by `ClusterConfig`, which rejects malformed entries, duplicate IDs and a node listed as its own peer. Without `RAFTKV_PEERS` the server runs exactly as in milestone 1: no Raft, no `raft-state` file.
+
+**Wiring (`RaftKvServer`).** In a cluster, a node opens `PersistentState` in its data directory (next to the log), creates a `RaftNode` on an `ExecutorScheduler` thread named `raft-{id}`, and serves the `Raft` gRPC service on its own port, separate from the client API. The last log index comes from `DurableKvStore::lastIndex`, which is now `synchronized`: the Raft thread reads it while writes run on gRPC threads. The last log term is 0 until log entries carry a term (milestone 3).
+
+**`RaftService`** (server side) has no logic: it hands each RPC to `RaftNode`, which handles it on the Raft thread, so gRPC threads never touch Raft state. If the node cannot answer (stopped, or a failed persist), the call fails with `UNAVAILABLE`.
+
+**`GrpcRaftTransport`** (client side) keeps one plaintext channel per peer and puts a **100 ms deadline** on every call (below the 150 ms minimum election timeout). A peer that never answers becomes a failed call, which `RaftNode` treats as a lost message.
+
+**Reconnecting after a restart.** Docker showed three delays between a peer coming back and the leader reaching it. Each one is now handled:
+
+| Cause | Effect seen | Fix |
+|---|---|---|
+| The JVM remembers a failed DNS lookup for 10 s; a stopped container's name does not resolve | Leader could not resolve the restarted peer for up to 10 s | DNS caching off (`networkaddress.cache.ttl` and `.negative.ttl` = 0) |
+| A connection attempt to a stopped container's address hangs for seconds instead of failing | Restarted node got no heartbeat for ~5 s (it stayed a pre-candidate thanks to PreVote) | Connect timeout of 250 ms per attempt |
+| gRPC waits longer and longer between reconnect attempts | Slow recovery after a long outage | `resetConnectBackoff()` after every `UNAVAILABLE` or `DEADLINE_EXCEEDED` |
+
+Before PreVote and these fixes, a leader restarted after 13 s took leadership back in every trial. Now, in three trials of stop leader, wait 13 s, start it again, the restarted node followed the new leader within about 0.2 s, and the new leader kept its term. The time from stopping a leader to a new one is about 0.25 s:
+
+```
+19:25:28.454 [shutdown] RaftKvServer - RaftKV stopped                  # leader c stopped
+19:25:28.656 [raft-b] node b became PRE_CANDIDATE in term 2
+19:25:28.684 [raft-b] node b became CANDIDATE in term 3
+19:25:28.717 [raft-b] node b became LEADER in term 3                   # 0.26 s later
+19:25:44.464 [main] PersistentState - Loaded Raft state: term 2, votedFor c
+19:25:44.598 [raft-c] node c became FOLLOWER in term 2
+19:25:44.755 [raft-c] node c became PRE_CANDIDATE in term 2            # no heartbeat yet; term stays
+19:25:44.788 [raft-c] node c became FOLLOWER in term 3                 # follows b; no election
+```
+
+**Known startup cost.** On a cold start the first RPCs take longer than the 100 ms deadline (connection setup, class loading), so the first few PreVote rounds fail and a leader appears after about 1 s. PreVote keeps those failed rounds from raising the term.
+
+**Logging.** slf4j-simple with timestamps (`HH:mm:ss.SSS`), so election timing can be read from the logs.
+
+## 4. Milestone 3: log replication (next)
 
 ### 4.1 Log entries gain a term
 

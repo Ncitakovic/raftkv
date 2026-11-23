@@ -49,7 +49,8 @@ public final class DurableKvStore implements Closeable {
         return stateMachine.get(key);
     }
 
-    public long lastIndex() {
+    /** Thread-safe: the Raft thread reads it while writes run on gRPC threads. */
+    public synchronized long lastIndex() {
         return wal.lastIndex();
     }
 
