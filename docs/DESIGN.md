@@ -117,6 +117,24 @@ A granted vote is fsync'd by `PersistentState` before `handle` returns. Every re
 - Read the last log entry's index and term in a single call (milestone 3), so the two values always come from the same log state.
 - PreVote (milestone 4): a node cut off from the cluster keeps raising its term and disrupts a healthy leader when it reconnects.
 
+### 3.4 Leader election state machine (done)
+
+`RaftNode` implements the FOLLOWER → CANDIDATE → LEADER diagram (Raft paper, Figure 4). `AppendEntries` is only a heartbeat; log replication comes in milestone 3.
+
+**One thread, injected time.** Every change to Raft state runs as a task on a `Scheduler`, which runs tasks one at a time on a single thread. Incoming RPCs (`onRequestVote`, `onAppendEntries`) and the responses the `RaftTransport` returns as `CompletableFuture`s are all handed to that thread, so no locks are needed. The scheduler is also the only clock: production uses `ExecutorScheduler` (a single-threaded `ScheduledExecutorService`), while tests use a `FakeScheduler` whose time moves only when the test calls `advance(ms)`. Election timeouts come from an injected `RandomGenerator`, so tests know each timeout exactly. Other threads read a published, immutable `RaftStatus` (role, term, known leader).
+
+- **Follower:** waits a random election timeout, 150–300 ms. The timer is reset **only** by a valid `AppendEntries` from the leader of the current term (or a newer one), or by granting a vote. A refused `RequestVote` or a stale `AppendEntries` does not reset it, so they cannot keep a node from noticing a dead leader.
+- **Candidate:** `PersistentState.startElection` raises the term and records its own vote in one fsync'd write, before any `RequestVote` goes out. The request carries the last log index and term. Votes are counted only if they answer the current round (same term, still a candidate), so a late vote from an earlier round never counts. Without a majority, the next timeout starts a new round in the next term.
+- **Leader:** with a majority (its own vote included) it sends heartbeats to every peer at once, then every 50 ms. Votes that arrive after it won are ignored.
+- **Stepping down:** any request or response with a higher term moves the node to that term (`advanceTerm`) and makes it a follower, cancelling the heartbeat timer. For an incoming `RequestVote`, `VoteHandler` may raise the term, so `RaftNode` compares `currentTerm` before and after; a vote can be refused and the node still steps down. A valid `AppendEntries` makes a candidate or leader a follower of its sender.
+- **Timer on stepping down:** a candidate keeps its running election timer; a leader has none, so it gets a new one, or it would never start another election.
+
+**Fail-stop on disk errors.** If the term or vote cannot be written, the node logs the error and stops: no reply is sent and no `RequestVote` goes out. Continuing without a durable vote could let it vote twice in one term.
+
+Role changes are logged as `node {id} became {ROLE} in term {term}`. A single-node cluster becomes leader on its own vote.
+
+**Not yet:** the gRPC `Raft` service, a gRPC `RaftTransport`, and wiring `RaftNode` into `RaftKvServer` are the next step.
+
 ## 4. Milestone 3: log replication (planned)
 
 ### 4.1 Log entries gain a term
