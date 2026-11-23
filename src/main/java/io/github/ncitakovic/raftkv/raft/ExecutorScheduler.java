@@ -44,6 +44,12 @@ public final class ExecutorScheduler implements Scheduler, AutoCloseable {
         return () -> future.cancel(false);
     }
 
+    /** Monotonic, unlike wall-clock time, so a clock adjustment cannot make a leader look silent. */
+    @Override
+    public long nowMillis() {
+        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime());
+    }
+
     /** Stops the thread; tasks not yet started are dropped. */
     @Override
     public void close() {

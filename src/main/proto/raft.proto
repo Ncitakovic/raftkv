@@ -40,6 +40,16 @@ message RequestVoteRequest {
   // Compared first: the log whose last entry has the higher term is more up to date; only when
   // the terms are equal does the longer log (higher last_log_index) win.
   uint64 last_log_term = 4;
+
+  // True for a PreVote (Ongaro thesis §9.6): "would you vote for me if I started an election?"
+  // Needed so a node that cannot win (cut off, or just restarted while a leader is healthy) does
+  // not raise its term and force the healthy leader to step down. In a PreVote, `term` is the term
+  // the sender WOULD use (its currentTerm + 1), but neither side changes its term or votedFor, and
+  // the receiver does not reset its election timer. The receiver says yes only if it has not heard
+  // from a leader within the minimum election timeout and the sender's log is at least as up to
+  // date as its own; a leader always says no. Only after a majority of PreVote yeses does the sender
+  // start a real election (pre_vote = false), whose rules are unchanged.
+  bool pre_vote = 5;
 }
 
 message RequestVoteResponse {
@@ -47,7 +57,7 @@ message RequestVoteResponse {
   // Needed so a candidate that is behind learns the newer term and steps down to follower.
   uint64 term = 1;
 
-  // True if the receiver voted for the candidate in this term.
+  // True if the receiver voted for the candidate in this term (for a PreVote: would vote).
   // The candidate becomes leader once it holds grants from a majority (counting its own vote).
   bool vote_granted = 2;
 }

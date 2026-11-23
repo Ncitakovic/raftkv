@@ -30,10 +30,12 @@ import java.util.stream.Collectors;
  * simulated in-memory network. Everything is driven by one seed: message delays and every node's
  * election timeouts. The same seed always replays the same run, so a failing seed can be debugged.
  *
- * <p><b>Network.</b> Each request and each response takes a random 1–10 ms. A message to a node that
- * is down, or over a link that is cut, fails (like a refused connection); a response is also lost if
- * the link is cut or the sender restarted while it was in flight. Nodes never share objects: they
- * only see each other's protobuf messages.
+ * <p><b>Network.</b> Each request and each response takes a random 1–10 ms (or a fixed delay, for a
+ * test that needs exact timing). A message to a node that is down, or over a link that is cut, fails
+ * (like a refused connection); a response is also lost if the link is cut or the sender restarted
+ * while it was in flight. {@link #blockRequests} fails requests in one direction only, like a peer
+ * whose old connection to a restarted node is still stuck while the restarted node's own new
+ * connections work. Nodes never share objects: they only see each other's protobuf messages.
  *
  * <p><b>Crash and restart.</b> {@link #crash} stops a node and drops it from the network. {@link #start}
  * after a crash creates a new {@link RaftNode} and {@link PersistentState} over the <i>same</i> data
@@ -58,20 +60,28 @@ final class SimulatedCluster {
     private final RaftConfig config = RaftConfig.defaults();
     private final FakeScheduler scheduler = new FakeScheduler();
     private final SplittableRandom networkRandom;
+    private final Integer fixedDelayMs; // null = random delays
     private final Map<String, SplittableRandom> nodeRandoms = new HashMap<>();
 
     private final Map<String, Member> running = new LinkedHashMap<>();
     private final Map<String, Integer> incarnations = new HashMap<>();
     private final Set<Set<String>> cutLinks = new HashSet<>();
+    private final Set<List<String>> blockedRequests = new HashSet<>(); // [from, to]
 
-    private final Map<Long, Set<String>> leadersByTerm = new TreeMap<>();
+    private final TreeMap<Long, Set<String>> leadersByTerm = new TreeMap<>();
     private final Map<String, Long> highestTermSeen = new HashMap<>();
 
     private record Member(RaftNode node, PersistentState state) {}
 
     SimulatedCluster(Path baseDir, List<String> ids, long seed) {
+        this(baseDir, ids, seed, null);
+    }
+
+    /** Every message takes exactly {@code fixedDelayMs}; election timeouts are still seeded. */
+    SimulatedCluster(Path baseDir, List<String> ids, long seed, Integer fixedDelayMs) {
         this.baseDir = baseDir;
         this.ids = List.copyOf(ids);
+        this.fixedDelayMs = fixedDelayMs;
         SplittableRandom root = new SplittableRandom(seed);
         this.networkRandom = root.split();
         for (String id : this.ids) {
@@ -141,8 +151,14 @@ final class SimulatedCluster {
         ids.stream().filter(other -> !other.equals(id)).forEach(other -> disconnect(id, other));
     }
 
+    /** Requests from {@code from} to {@code to} fail; requests the other way, and their replies, work. */
+    void blockRequests(String from, String to) {
+        blockedRequests.add(List.of(from, to));
+    }
+
     void healAll() {
         cutLinks.clear();
+        blockedRequests.clear();
     }
 
     private boolean connected(String a, String b) {
@@ -237,6 +253,11 @@ final class SimulatedCluster {
         return leadersByTerm;
     }
 
+    /** The highest term that has had a leader so far (0 if none). */
+    long highestLeaderTerm() {
+        return leadersByTerm.isEmpty() ? 0 : leadersByTerm.lastKey();
+    }
+
     /** Lets a test run RPCs it sends itself to completion. */
     void runPending() {
         scheduler.runPending();
@@ -274,7 +295,7 @@ final class SimulatedCluster {
     // ---- simulated network ----
 
     private int delay() {
-        return networkRandom.nextInt(MIN_DELAY_MS, MAX_DELAY_MS + 1);
+        return fixedDelayMs != null ? fixedDelayMs : networkRandom.nextInt(MIN_DELAY_MS, MAX_DELAY_MS + 1);
     }
 
     /**
@@ -286,7 +307,7 @@ final class SimulatedCluster {
         int senderIncarnation = incarnations.get(from);
         scheduler.schedule(Duration.ofMillis(delay()), () -> {
             Member target = running.get(to);
-            if (target == null || !connected(from, to)) {
+            if (target == null || !connected(from, to) || blockedRequests.contains(List.of(from, to))) {
                 result.completeExceptionally(new IOException(to + " is unreachable from " + from));
                 return;
             }

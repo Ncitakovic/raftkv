@@ -22,13 +22,14 @@ import org.junit.jupiter.api.io.TempDir;
 
 /**
  * Leader election on one node, driven by a fake clock. Every election timeout is exactly
- * {@link #TIMEOUT} ms (see {@link FixedRandom}), so "199 ms: still a follower, 200 ms: candidate"
+ * {@link #TIMEOUT} ms (see {@link FixedRandom}), so "199 ms: still a follower, 200 ms: PreVote"
  * can be asserted precisely. Peers are played by the test through {@link InMemoryTransport}.
  */
 class RaftNodeTest {
 
     private static final long TIMEOUT = 200;
     private static final long HEARTBEAT = RaftConfig.defaults().heartbeatInterval().toMillis(); // 50
+    private static final long ELECTION_TIMEOUT_MIN = RaftConfig.defaults().electionTimeoutMin().toMillis(); // 150
 
     @TempDir
     Path dir;
@@ -62,10 +63,12 @@ class RaftNodeTest {
         scheduler.runPending();
     }
 
-    /** Starts a 3-node cluster member and lets it time out into its first election (term 1). */
+    /** Starts a 3-node cluster member, lets it time out, and grants n2's PreVote: candidate of term 1. */
     private void startCandidate() {
         startNode(List.of("n2", "n3"));
         scheduler.advance(TIMEOUT);
+        assertEquals(Role.PRE_CANDIDATE, node.status().role());
+        preVote("n2", true);
         assertEquals(Role.CANDIDATE, node.status().role());
     }
 
@@ -76,9 +79,31 @@ class RaftNodeTest {
         assertEquals(Role.LEADER, node.status().role());
     }
 
-    /** Peer {@code peer} answers this node's latest RequestVote to it. */
+    private List<InMemoryTransport.Sent<RequestVoteRequest, RequestVoteResponse>> sent(boolean preVote) {
+        return transport.requestVotes().stream().filter(s -> s.request().getPreVote() == preVote).toList();
+    }
+
+    private InMemoryTransport.Sent<RequestVoteRequest, RequestVoteResponse> lastSent(String peer, boolean preVote) {
+        return sent(preVote).reversed().stream()
+                .filter(s -> s.peerId().equals(peer))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("No " + (preVote ? "PreVote" : "RequestVote") + " to " + peer));
+    }
+
+    /** Peer {@code peer} answers this node's latest PreVote to it, in its own (unchanged) term. */
+    private void preVote(String peer, boolean granted) {
+        preVote(peer, state.currentTerm(), granted);
+    }
+
+    private void preVote(String peer, long peerTerm, boolean granted) {
+        lastSent(peer, true).reply()
+                .complete(RequestVoteResponse.newBuilder().setTerm(peerTerm).setVoteGranted(granted).build());
+        scheduler.runPending();
+    }
+
+    /** Peer {@code peer} answers this node's latest real RequestVote to it. */
     private void vote(String peer, long term, boolean granted) {
-        transport.lastRequestVoteTo(peer).reply()
+        lastSent(peer, false).reply()
                 .complete(RequestVoteResponse.newBuilder().setTerm(term).setVoteGranted(granted).build());
         scheduler.runPending();
     }
@@ -92,20 +117,31 @@ class RaftNodeTest {
 
     private RequestVoteResponse requestVoteFrom(String candidate, long term, long lastIndex, long lastTerm)
             throws Exception {
+        return incomingVote(false, candidate, term, lastIndex, lastTerm);
+    }
+
+    private RequestVoteResponse preVoteFrom(String candidate, long term, long lastIndex, long lastTerm)
+            throws Exception {
+        return incomingVote(true, candidate, term, lastIndex, lastTerm);
+    }
+
+    private RequestVoteResponse incomingVote(boolean preVote, String candidate, long term, long lastIndex,
+            long lastTerm) throws Exception {
         CompletableFuture<RequestVoteResponse> reply = node.onRequestVote(RequestVoteRequest.newBuilder()
-                .setTerm(term).setCandidateId(candidate).setLastLogIndex(lastIndex).setLastLogTerm(lastTerm).build());
+                .setPreVote(preVote).setTerm(term).setCandidateId(candidate)
+                .setLastLogIndex(lastIndex).setLastLogTerm(lastTerm).build());
         scheduler.runPending();
         return reply.get();
     }
 
-    private long requestVotesInTerm(long term) {
-        return transport.requestVotes().stream().filter(s -> s.request().getTerm() == term).count();
+    private long realRequestVotesInTerm(long term) {
+        return sent(false).stream().filter(s -> s.request().getTerm() == term).count();
     }
 
-    // ---- follower → candidate ----
+    // ---- follower → pre-candidate → candidate ----
 
     @Test
-    void followerBecomesCandidateAfterElectionTimeoutAndTermGrowsByOne() {
+    void electionTimeoutStartsAPreVoteThatChangesNeitherTermNorVote() {
         startNode(List.of("n2", "n3"));
         assertEquals(new RaftStatus(Role.FOLLOWER, 0, Optional.empty()), node.status());
 
@@ -114,24 +150,82 @@ class RaftNodeTest {
         assertTrue(transport.requestVotes().isEmpty());
 
         scheduler.advance(1);
+        assertEquals(new RaftStatus(Role.PRE_CANDIDATE, 0, Optional.empty()), node.status());
+        assertEquals(0, state.currentTerm(), "no startElection before a PreVote majority");
+        assertTrue(state.votedFor().isEmpty());
+        assertEquals(List.of("n2", "n3"), sent(true).stream().map(s -> s.peerId()).toList());
+        for (var s : sent(true)) {
+            assertEquals(1, s.request().getTerm(), "PreVote asks about currentTerm + 1");
+            assertEquals("n1", s.request().getCandidateId());
+        }
+        assertTrue(sent(false).isEmpty(), "no real RequestVote yet");
+    }
+
+    @Test
+    void preVoteMajorityStartsTheRealElection() {
+        startNode(List.of("n2", "n3"));
+        scheduler.advance(TIMEOUT);
+
+        preVote("n2", true); // n1 + n2 = 2 of 3
+
         assertEquals(new RaftStatus(Role.CANDIDATE, 1, Optional.empty()), node.status());
         assertEquals(1, state.currentTerm());
         assertEquals(Optional.of("n1"), state.votedFor(), "a candidate votes for itself");
-        assertEquals(List.of("n2", "n3"), transport.requestVotes().stream().map(s -> s.peerId()).toList());
-        for (var sent : transport.requestVotes()) {
-            assertEquals(1, sent.request().getTerm());
-            assertEquals("n1", sent.request().getCandidateId());
+        assertEquals(List.of("n2", "n3"), sent(false).stream().map(s -> s.peerId()).toList());
+        for (var s : sent(false)) {
+            assertEquals(1, s.request().getTerm());
+            assertFalse(s.request().getPreVote());
         }
     }
 
     @Test
-    void requestVoteCarriesLastLogIndexAndTermFromTheSuppliers() {
-        startNode(List.of("n2", "n3"), 7, 3);
+    void withoutAPreVoteMajorityTheTermNeverGrows() {
+        startNode(List.of("n2", "n3"));
         scheduler.advance(TIMEOUT);
 
-        RequestVoteRequest sent = transport.lastRequestVoteTo("n2").request();
-        assertEquals(7, sent.getLastLogIndex());
-        assertEquals(3, sent.getLastLogTerm());
+        // Both refuse, and their replies carry a much higher term: a PreVote reply changes nothing.
+        preVote("n2", 7, false);
+        preVote("n3", 7, false);
+        assertEquals(new RaftStatus(Role.PRE_CANDIDATE, 0, Optional.empty()), node.status());
+
+        scheduler.advance(TIMEOUT); // a new PreVote round, still about term 1
+        scheduler.advance(TIMEOUT); // and another
+        assertEquals(new RaftStatus(Role.PRE_CANDIDATE, 0, Optional.empty()), node.status());
+        assertEquals(0, state.currentTerm());
+        assertEquals(6, sent(true).size());
+        assertTrue(sent(true).stream().allMatch(s -> s.request().getTerm() == 1));
+        assertTrue(sent(false).isEmpty());
+    }
+
+    @Test
+    void preVoteFromAnEarlierRoundDoesNotCount() {
+        // Five nodes: a majority is 3.
+        startNode(List.of("n2", "n3", "n4", "n5"));
+        scheduler.advance(TIMEOUT); // PreVote round 1
+        var lateRound1Yes = lastSent("n2", true);
+        scheduler.advance(TIMEOUT); // nobody answered: round 2, same term
+
+        lateRound1Yes.reply().complete(RequestVoteResponse.newBuilder().setTerm(0).setVoteGranted(true).build());
+        scheduler.runPending();
+        preVote("n3", true);
+        assertEquals(Role.PRE_CANDIDATE, node.status().role(), "only n1 and n3 said yes in round 2");
+
+        preVote("n4", true);
+        assertEquals(new RaftStatus(Role.CANDIDATE, 1, Optional.empty()), node.status());
+    }
+
+    @Test
+    void preVoteAndRequestVoteCarryLastLogIndexAndTermFromTheSuppliers() {
+        startNode(List.of("n2", "n3"), 7, 3);
+        scheduler.advance(TIMEOUT);
+        RequestVoteRequest pre = lastSent("n2", true).request();
+        assertEquals(7, pre.getLastLogIndex());
+        assertEquals(3, pre.getLastLogTerm());
+
+        preVote("n2", true);
+        RequestVoteRequest real = lastSent("n2", false).request();
+        assertEquals(7, real.getLastLogIndex());
+        assertEquals(3, real.getLastLogTerm());
     }
 
     // ---- candidate ----
@@ -144,9 +238,9 @@ class RaftNodeTest {
         assertEquals(new RaftStatus(Role.LEADER, 1, Optional.of("n1")), node.status());
         // Heartbeats to every peer at once...
         assertEquals(List.of("n2", "n3"), transport.appendEntries().stream().map(s -> s.peerId()).toList());
-        for (var sent : transport.appendEntries()) {
-            assertEquals(1, sent.request().getTerm());
-            assertEquals("n1", sent.request().getLeaderId());
+        for (var s : transport.appendEntries()) {
+            assertEquals(1, s.request().getTerm());
+            assertEquals("n1", s.request().getLeaderId());
         }
         // ...then every 50 ms.
         scheduler.advance(HEARTBEAT - 1);
@@ -163,31 +257,36 @@ class RaftNodeTest {
     }
 
     @Test
-    void candidateWithoutMajorityStartsANewRoundWithTermPlusOne() {
-        startCandidate();
+    void splitVoteGoesBackToAPreVoteInTheSameTerm() {
+        startCandidate(); // term 1
         vote("n2", 1, false);
         assertEquals(Role.CANDIDATE, node.status().role());
 
-        scheduler.advance(TIMEOUT - 1);
+        scheduler.advance(TIMEOUT); // the election times out
+        assertEquals(new RaftStatus(Role.PRE_CANDIDATE, 1, Optional.empty()), node.status());
         assertEquals(1, state.currentTerm());
+        assertEquals(2, lastSent("n2", true).request().getTerm());
+        assertEquals(0, realRequestVotesInTerm(2), "no real election before a PreVote majority");
 
-        scheduler.advance(1); // election times out
+        preVote("n3", true);
         assertEquals(new RaftStatus(Role.CANDIDATE, 2, Optional.empty()), node.status());
-        assertEquals(Optional.of("n1"), state.votedFor());
-        assertEquals(2, requestVotesInTerm(2), "a new RequestVote to every peer");
+        assertEquals(2, realRequestVotesInTerm(2));
     }
 
     @Test
-    void voteFromAnEarlierRoundDoesNotCountInTheNextRound() {
-        // Five nodes: a majority is 3.
+    void voteFromAnEarlierTermDoesNotCountInTheNextElection() {
         startNode(List.of("n2", "n3", "n4", "n5"));
-        scheduler.advance(TIMEOUT); // round 1, term 1
-        var lateRound1Vote = transport.lastRequestVoteTo("n2");
-        scheduler.advance(TIMEOUT); // nobody answered: round 2, term 2
+        scheduler.advance(TIMEOUT);
+        preVote("n2", true);
+        preVote("n3", true); // 3 of 5: candidate of term 1
+        var lateTerm1Vote = lastSent("n2", false);
+        scheduler.advance(TIMEOUT); // nobody voted: PreVote again
+        preVote("n2", true);
+        preVote("n3", true); // candidate of term 2
         assertEquals(2, state.currentTerm());
 
         // n2's grant for term 1 arrives late. Counted, it would make 3 with n3's below.
-        lateRound1Vote.reply().complete(RequestVoteResponse.newBuilder().setTerm(1).setVoteGranted(true).build());
+        lateTerm1Vote.reply().complete(RequestVoteResponse.newBuilder().setTerm(1).setVoteGranted(true).build());
         scheduler.runPending();
         vote("n3", 2, true);
         assertEquals(Role.CANDIDATE, node.status().role(), "only n1 and n3 voted in term 2");
@@ -230,6 +329,77 @@ class RaftNodeTest {
         assertEquals(Optional.empty(), state.votedFor());
     }
 
+    @Test
+    void preCandidateReceivingAHeartbeatBecomesFollower() throws Exception {
+        startNode(List.of("n2", "n3"));
+        scheduler.advance(TIMEOUT);
+        assertEquals(Role.PRE_CANDIDATE, node.status().role());
+
+        assertTrue(heartbeatFrom("n2", 1).getSuccess());
+
+        assertEquals(new RaftStatus(Role.FOLLOWER, 1, Optional.of("n2")), node.status());
+        preVote("n3", true); // a late yes from the abandoned round
+        assertEquals(Role.FOLLOWER, node.status().role());
+        assertEquals(1, state.currentTerm());
+    }
+
+    // ---- answering PreVotes ----
+
+    @Test
+    void followerThatHeardTheLeaderRecentlyRefusesAPreVoteAndChangesNothing() throws Exception {
+        startNode(List.of("n2", "n3"));
+        scheduler.advance(100);
+        heartbeatFrom("n2", 1); // the timer now fires at t = 300
+
+        scheduler.advance(ELECTION_TIMEOUT_MIN - 1); // t = 249: still within the minimum timeout
+        RequestVoteResponse reply = preVoteFrom("n3", 2, 0, 0);
+
+        assertFalse(reply.getVoteGranted());
+        assertEquals(1, reply.getTerm());
+        assertEquals(new RaftStatus(Role.FOLLOWER, 1, Optional.of("n2")), node.status());
+        assertTrue(state.votedFor().isEmpty());
+        scheduler.advance(51); // t = 300: the PreVote did not reset the timer
+        assertEquals(Role.PRE_CANDIDATE, node.status().role());
+    }
+
+    @Test
+    void followerWithoutARecentLeaderGrantsAPreVoteWithoutChangingTermVoteOrTimer() throws Exception {
+        startNode(List.of("n2", "n3"));
+        scheduler.advance(10);
+        heartbeatFrom("n2", 1); // the timer now fires at t = 210
+
+        scheduler.advance(ELECTION_TIMEOUT_MIN); // t = 160: 150 ms of silence
+        RequestVoteResponse reply = preVoteFrom("n3", 2, 0, 0);
+
+        assertTrue(reply.getVoteGranted());
+        assertEquals(1, reply.getTerm());
+        assertEquals(new RaftStatus(Role.FOLLOWER, 1, Optional.of("n2")), node.status());
+        assertEquals(1, state.currentTerm());
+        assertTrue(state.votedFor().isEmpty(), "a PreVote yes is not a vote");
+        scheduler.advance(50); // t = 210: the timer was not reset
+        assertEquals(Role.PRE_CANDIDATE, node.status().role());
+    }
+
+    @Test
+    void leaderAlwaysRefusesAPreVote() throws Exception {
+        startLeader();
+        scheduler.advance(10 * TIMEOUT); // a leader hears no heartbeats, but it is the active leader
+
+        RequestVoteResponse reply = preVoteFrom("n3", 2, 0, 0);
+
+        assertFalse(reply.getVoteGranted());
+        assertEquals(new RaftStatus(Role.LEADER, 1, Optional.of("n1")), node.status());
+    }
+
+    @Test
+    void preVoteFromANodeWithAnOlderLogIsRefused() throws Exception {
+        startNode(List.of("n2", "n3"), 5, 2);
+
+        assertFalse(preVoteFrom("n3", 1, 9, 1).getVoteGranted());
+        assertTrue(preVoteFrom("n3", 1, 5, 2).getVoteGranted());
+        assertEquals(0, state.currentTerm());
+    }
+
     // ---- leader steps down ----
 
     @Test
@@ -252,11 +422,11 @@ class RaftNodeTest {
         assertEquals(new RaftStatus(Role.FOLLOWER, 5, Optional.empty()), node.status());
         assertEquals(5, state.currentTerm());
 
-        int sent = transport.appendEntries().size();
+        int sentHeartbeats = transport.appendEntries().size();
         scheduler.advance(TIMEOUT);
-        assertEquals(sent, transport.appendEntries().size(), "no heartbeat after stepping down");
-        // As a follower it got a new election timer, so it is now campaigning in term 6.
-        assertEquals(new RaftStatus(Role.CANDIDATE, 6, Optional.empty()), node.status());
+        assertEquals(sentHeartbeats, transport.appendEntries().size(), "no heartbeat after stepping down");
+        // As a follower it got a new election timer, so it is now asking for PreVotes about term 6.
+        assertEquals(new RaftStatus(Role.PRE_CANDIDATE, 5, Optional.empty()), node.status());
     }
 
     @Test
@@ -282,9 +452,9 @@ class RaftNodeTest {
         assertEquals(new RaftStatus(Role.FOLLOWER, 1, Optional.of("n2")), node.status());
         assertTrue(transport.requestVotes().isEmpty());
 
-        // The leader goes quiet: one timeout later this node campaigns.
+        // The leader goes quiet: one timeout later this node asks for PreVotes.
         scheduler.advance(TIMEOUT);
-        assertEquals(new RaftStatus(Role.CANDIDATE, 2, Optional.empty()), node.status());
+        assertEquals(new RaftStatus(Role.PRE_CANDIDATE, 1, Optional.empty()), node.status());
     }
 
     @Test
@@ -297,7 +467,7 @@ class RaftNodeTest {
         scheduler.advance(150); // t = 250: the original timer (t = 200) would have fired
         assertEquals(Role.FOLLOWER, node.status().role());
         scheduler.advance(50); // t = 300: 200 ms after the vote
-        assertEquals(new RaftStatus(Role.CANDIDATE, 2, Optional.empty()), node.status());
+        assertEquals(new RaftStatus(Role.PRE_CANDIDATE, 1, Optional.empty()), node.status());
     }
 
     @Test
@@ -313,13 +483,13 @@ class RaftNodeTest {
         assertEquals(new RaftStatus(Role.FOLLOWER, 3, Optional.empty()), node.status());
 
         scheduler.advance(50); // t = 300: not reset by the stale AppendEntries
-        assertEquals(new RaftStatus(Role.CANDIDATE, 4, Optional.empty()), node.status());
+        assertEquals(new RaftStatus(Role.PRE_CANDIDATE, 3, Optional.empty()), node.status());
     }
 
     @Test
     void rejectedRequestVoteWithAHigherTermStillMovesTheNodeToThatTermAsFollower() throws Exception {
         startNode(List.of("n2", "n3"), 5, 2); // our log ends at index 5, term 2
-        scheduler.advance(TIMEOUT); // candidate in term 1; its next timeout is at t = 400
+        scheduler.advance(TIMEOUT); // PreVote in term 0; its next timeout is at t = 400
         scheduler.advance(100); // t = 300
 
         // n3 is in a newer term but its log is behind ours: no vote.
@@ -332,7 +502,7 @@ class RaftNodeTest {
 
         // Refusing is not granting: the timer was not reset and still fires at t = 400.
         scheduler.advance(100);
-        assertEquals(new RaftStatus(Role.CANDIDATE, 5, Optional.empty()), node.status());
+        assertEquals(new RaftStatus(Role.PRE_CANDIDATE, 4, Optional.empty()), node.status());
     }
 
     // ---- edge cases ----
@@ -350,11 +520,12 @@ class RaftNodeTest {
     void nodeStopsIfItCannotPersistAnElection() throws Exception {
         startNode(List.of("n2", "n3"));
         Files.delete(stateDir); // nothing written yet, so the directory is empty; startElection will fail
+        scheduler.advance(TIMEOUT); // the PreVote writes nothing, so it still goes out
 
-        scheduler.advance(TIMEOUT);
+        preVote("n2", true); // majority: now startElection must write, and fails
 
-        assertTrue(transport.requestVotes().isEmpty(), "no RequestVote without a durable term and vote");
-        assertEquals(Role.FOLLOWER, node.status().role());
+        assertTrue(sent(false).isEmpty(), "no RequestVote without a durable term and vote");
+        assertEquals(0, node.status().term());
         CompletableFuture<AppendEntriesResponse> reply =
                 node.onAppendEntries(AppendEntriesRequest.newBuilder().setTerm(1).setLeaderId("n2").build());
         scheduler.runPending();

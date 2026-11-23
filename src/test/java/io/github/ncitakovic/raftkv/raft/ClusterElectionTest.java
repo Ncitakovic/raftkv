@@ -77,38 +77,75 @@ class ClusterElectionTest {
         assertTrue(cluster.status(newLeader).term() > oldTerm, cluster.describe());
 
         // The old leader restarts from its data directory and joins as a follower.
+        long newTerm = cluster.status(newLeader).term();
         cluster.start(oldLeader);
         assertEquals(newLeader, cluster.awaitStableLeader(ELECTION_LIMIT_MS));
         assertEquals(Role.FOLLOWER, cluster.status(oldLeader).role());
+        assertEquals(newTerm, cluster.status(newLeader).term(), "the restart caused no election");
+    }
+
+    // (b') PreVote
+    @ParameterizedTest(name = "seed {0}")
+    @MethodSource("seeds")
+    void restartedOldLeaderThatHearsNoHeartbeatsDoesNotDisruptTheNewLeader(long seed) {
+        SimulatedCluster cluster = cluster(seed);
+        cluster.startAll();
+        String oldLeader = cluster.awaitStableLeader(ELECTION_LIMIT_MS);
+        long oldTerm = cluster.status(oldLeader).term();
+        cluster.crash(oldLeader);
+        String newLeader = cluster.awaitStableLeader(others(oldLeader), ELECTION_LIMIT_MS);
+        long newTerm = cluster.status(newLeader).term();
+
+        // As seen in Docker: after the restart, the others' connections to it stay stuck for a while,
+        // so no heartbeat reaches it, while its own new connections to them work. It times out again
+        // and again (every 150-300 ms) and asks for PreVotes, which the others refuse: they hear the
+        // leader. Without PreVote it would raise its term and force the new leader to step down.
+        others(oldLeader).forEach(other -> cluster.blockRequests(other, oldLeader));
+        cluster.start(oldLeader);
+        cluster.run(2_000);
+
+        assertEquals(new RaftStatus(Role.LEADER, newTerm, Optional.of(newLeader)), cluster.status(newLeader),
+                cluster.describe());
+        assertEquals(newTerm, cluster.highestLeaderTerm(), "no newer term");
+        RaftStatus restarted = cluster.status(oldLeader);
+        assertEquals(Role.PRE_CANDIDATE, restarted.role(), cluster.describe());
+        assertEquals(oldTerm, restarted.term(), "it never raised its term");
+
+        // Once heartbeats get through, it simply follows the new leader.
+        cluster.healAll();
+        assertEquals(newLeader, cluster.awaitStableLeader(ELECTION_LIMIT_MS));
+        assertEquals(newTerm, cluster.status(oldLeader).term());
     }
 
     // (c)
     @ParameterizedTest(name = "seed {0}")
     @MethodSource("seeds")
-    void partitionOneVersusTwoOnlyTheMajorityElectsALeader(long seed) {
+    void partitionOneVersusTwoLoneNodeNeitherRaisesTheTermNorDisruptsTheLeader(long seed) {
         SimulatedCluster cluster = cluster(seed);
         cluster.startAll();
         String leader = cluster.awaitStableLeader(ELECTION_LIMIT_MS);
+        long term = cluster.status(leader).term();
         String alone = others(leader).getFirst();
-        long termBefore = cluster.status(alone).term();
 
         cluster.isolate(alone);
         cluster.run(3_000);
 
-        // The side with two nodes still has a leader that both agree on.
-        cluster.awaitStableLeader(others(alone), 0);
-        // The lone node keeps timing out and campaigning in ever higher terms, but never wins:
-        // a vote from itself is 1 of 3, never a majority.
-        RaftStatus aloneStatus = cluster.status(alone);
-        assertEquals(Role.CANDIDATE, aloneStatus.role(), cluster.describe());
-        assertTrue(aloneStatus.term() > termBefore + 1, "it kept trying: " + cluster.describe());
+        // The side with two nodes keeps its leader, in the same term.
+        assertEquals(leader, cluster.awaitStableLeader(others(alone), 0));
+        assertEquals(term, cluster.status(leader).term());
+        // The lone node keeps timing out and asking for PreVotes that never arrive. Its term stays:
+        // with PreVote, a node raises its term only after a majority said it could win.
+        assertEquals(new RaftStatus(Role.PRE_CANDIDATE, term, Optional.empty()), cluster.status(alone),
+                cluster.describe());
         cluster.leadersByTerm().values().forEach(leaders -> assertFalse(leaders.contains(alone), cluster.describe()));
 
-        // After the partition heals, the cluster settles on one leader again. Its term is at least
-        // the lone node's: the lone node's higher term forces a new election (no PreVote yet).
+        // After the partition heals, the lone node follows the same leader; nobody's term changed.
         cluster.healAll();
-        String after = cluster.awaitStableLeader(ELECTION_LIMIT_MS);
-        assertTrue(cluster.status(after).term() >= aloneStatus.term(), cluster.describe());
+        assertEquals(leader, cluster.awaitStableLeader(ELECTION_LIMIT_MS));
+        for (String id : IDS) {
+            assertEquals(term, cluster.status(id).term(), cluster.describe());
+        }
+        assertEquals(term, cluster.highestLeaderTerm());
     }
 
     // (d)
@@ -142,12 +179,16 @@ class ClusterElectionTest {
     @ParameterizedTest(name = "seed {0}")
     @MethodSource("seeds")
     void splitVoteIsResolvedInALaterRound(long seed) {
-        SimulatedCluster cluster = cluster(seed);
-        // c is down. a and b time out at the same instant: both become candidates of term 1 and
-        // vote for themselves, so each refuses the other and neither gets 2 of 3 votes.
+        // Every message takes exactly 5 ms here, so the timing below is exact; later election
+        // timeouts are still random per seed.
+        SimulatedCluster cluster = new SimulatedCluster(dir, IDS, seed, 5);
+        // c is down. a and b time out at the same instant (t = 150) and ask each other for a PreVote.
+        // Neither has a leader, so both say yes (t = 155), and at t = 160 both become candidates of
+        // term 1 and vote for themselves. Each then refuses the other's real RequestVote (t = 165),
+        // so neither gets 2 of 3 votes.
         cluster.start("a", 150L);
         cluster.start("b", 150L);
-        cluster.run(150);
+        cluster.run(160);
         assertEquals(new RaftStatus(Role.CANDIDATE, 1, Optional.empty()), cluster.status("a"));
         assertEquals(new RaftStatus(Role.CANDIDATE, 1, Optional.empty()), cluster.status("b"));
 
